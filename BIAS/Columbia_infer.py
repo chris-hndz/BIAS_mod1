@@ -38,78 +38,181 @@ parser.add_argument('--nDataLoaderThread', type=int, default=1,  help='Number of
 args = parser.parse_args()
 
 def create_video(fileName, dir):
-	video = cv2.VideoCapture(os.path.join(dir, fileName + '.avi'))
-	videoFeature = []
-	while video.isOpened():
-		ret, frames = video.read()
-		if ret == True:
-			face = cv2.cvtColor(frames, cv2.COLOR_BGR2GRAY)
-			face = cv2.resize(face, (224,224))
-			face = face[int(112-(112/2)):int(112+(112/2)), int(112-(112/2)):int(112+(112/2))]
-			videoFeature.append(face)
-		else:
-			break
-	video.release()
-	videoFeature = numpy.array(videoFeature)
-	return videoFeature
+    video_path = os.path.join(dir, os.path.basename(fileName) + '.avi')
+    if not os.path.exists(video_path):
+        print(f"Error: El archivo de video {video_path} no existe")
+        return numpy.zeros((0,))
+        
+    video = cv2.VideoCapture(video_path)
+    if not video.isOpened():
+        print(f"Error: No se puede abrir el video {video_path}")
+        return numpy.zeros((0,))
+        
+    videoFeature = []
+    frame_count = 0
+    while video.isOpened():
+        ret, frames = video.read()
+        if ret == True:
+            face = cv2.cvtColor(frames, cv2.COLOR_BGR2GRAY)
+            face = cv2.resize(face, (224,224))
+            face = face[int(112-(112/2)):int(112+(112/2)), int(112-(112/2)):int(112+(112/2))]
+            videoFeature.append(face)
+            frame_count += 1
+        else:
+            break
+    video.release()
+    
+    if frame_count == 0:
+        print(f"Advertencia: No se encontraron frames en el video {video_path}")
+        return numpy.zeros((0,))
+        
+    videoFeature = numpy.array(videoFeature)
+    
+    # Verifica si el arreglo tiene la forma correcta
+    if len(videoFeature.shape) < 3:
+        print(f"Advertencia: videoFeature tiene forma {videoFeature.shape}")
+        # Si solo hay un frame, añade una dimensión
+        if len(videoFeature.shape) == 2:
+            videoFeature = videoFeature.reshape(1, videoFeature.shape[0], videoFeature.shape[1])
+        # Si es unidimensional (caso extremo), crea un arreglo vacío con la forma correcta
+        elif len(videoFeature.shape) == 1:
+            print("Error: No se pudieron cargar frames correctamente del video")
+            videoFeature = numpy.zeros((0,))
+    
+    return videoFeature
+
 
 def evaluate_network(files, args):
-	# GPU: active speaker detection by pretrained model
-	s = bias(**vars(args))
-	ckpt = torch.load(args.pretrainModel, map_location='cuda')
-	s.load_state_dict(ckpt)
+    # GPU: active speaker detection by pretrained model
+    s = bias(**vars(args))
+    ckpt = torch.load(args.pretrainModel, map_location='cuda')
+    s.load_state_dict(ckpt)
 
-	sys.stderr.write("Model %s loaded from previous state! \r\n"%args.pretrainModel)
-	s.eval()
-	allScores = []
-	# durationSet = {1,2,4,6} # To make the result more reliable
-	# durationSet = {1,1,1,2,2,2,3,3,4,5,6} # Use this line can get more reliable result
-	durationSet = {12,24,48,60} 
-	
-	for file in tqdm.tqdm(files, total = len(files)):
-		fileName = os.path.splitext(file.split('/')[-1])[0] # Load audio and video
-		_, audio = wavfile.read(os.path.join(args.pycropPath, fileName + '.wav'))
-		audioFeature = python_speech_features.mfcc(audio, 16000, numcep = 13, winlen = 0.025, winstep = 0.010)
+    sys.stderr.write("Model %s loaded from previous state! \r\n"%args.pretrainModel)
+    s.eval()
+    allScores = []
+    durationSet = {12,24,48,60} 
+    
+    for file in tqdm.tqdm(files, total = len(files)):
+        fileName = os.path.splitext(file.split('/')[-1])[0] # Load audio and video
+        try:
+            # Intenta cargar el audio
+            _, audio = wavfile.read(os.path.join(args.pycropPath, os.path.basename(fileName) + '.wav'))
+            audioFeature = python_speech_features.mfcc(audio, 16000, numcep = 13, winlen = 0.025, winstep = 0.010)
 
-		videoFeature = create_video(fileName, args.pycropPath)
-		videoFeatureBody = create_video(fileName, args.pycropPathBody)
-		
-		length = min((audioFeature.shape[0] - audioFeature.shape[0] % 4) / 100, videoFeature.shape[0])
-		audioFeature = audioFeature[:int(round(length * 100)),:]
-		videoFeature = videoFeature[:int(round(length * 25)),:,:]
-		videoFeatureBody = videoFeatureBody[:int(round(length * 25)),:,:]
-		allScore = [] # Evaluation use model
-		for duration in durationSet:
-			batchSize = int(math.ceil(length / duration))
-			scores = []
-			with torch.no_grad():
-				for i in range(batchSize):
+            # Intenta cargar los videos
+            videoFeature = create_video(fileName, args.pycropPath)
+            videoFeatureBody = create_video(fileName, args.pycropPathBody)
+            
+            # Verifica si los videos se cargaron correctamente
+            if videoFeature.shape[0] == 0 or videoFeatureBody.shape[0] == 0:
+                print(f"Error: No se pudieron cargar frames para el video {fileName}")
+                # Crea tensores vacíos con la forma correcta
+                if videoFeature.shape[0] == 0:
+                    videoFeature = numpy.zeros((25, 112, 112))
+                if videoFeatureBody.shape[0] == 0:
+                    videoFeatureBody = numpy.zeros((25, 112, 112))
+            
+            # Asegúrate de que todos los tensores tengan al menos un frame
+            min_frames = 25  # Número mínimo de frames
+            if videoFeature.shape[0] < min_frames:
+                # Repite el último frame hasta alcanzar min_frames
+                last_frame = videoFeature[-1] if videoFeature.shape[0] > 0 else numpy.zeros((112, 112))
+                padding = numpy.array([last_frame] * (min_frames - videoFeature.shape[0]))
+                videoFeature = numpy.vstack((videoFeature, padding)) if videoFeature.shape[0] > 0 else padding
+            
+            if videoFeatureBody.shape[0] < min_frames:
+                last_frame = videoFeatureBody[-1] if videoFeatureBody.shape[0] > 0 else numpy.zeros((112, 112))
+                padding = numpy.array([last_frame] * (min_frames - videoFeatureBody.shape[0]))
+                videoFeatureBody = numpy.vstack((videoFeatureBody, padding)) if videoFeatureBody.shape[0] > 0 else padding
+            
+            # Asegúrate de que el audio tenga suficientes frames
+            min_audio_frames = min_frames * 4  # 4 frames de audio por cada frame de video
+            if audioFeature.shape[0] < min_audio_frames:
+                last_frame = audioFeature[-1] if audioFeature.shape[0] > 0 else numpy.zeros((13,))
+                padding = numpy.array([last_frame] * (min_audio_frames - audioFeature.shape[0]))
+                audioFeature = numpy.vstack((audioFeature, padding)) if audioFeature.shape[0] > 0 else padding
+            
+            length = min((audioFeature.shape[0] - audioFeature.shape[0] % 4) / 100, videoFeature.shape[0])
+            length = max(length, 1)  # Asegúrate de que length sea al menos 1
+            
+            audioFeature = audioFeature[:int(round(length * 100)),:]
+            videoFeature = videoFeature[:int(round(length * 25)),:,:]
+            videoFeatureBody = videoFeatureBody[:int(round(length * 25)),:,:]
+            
+            allScore = [] # Evaluation use model
+            for duration in durationSet:
+                batchSize = int(math.ceil(length / duration))
+                batchSize = max(batchSize, 1)  # Asegúrate de que batchSize sea al menos 1
+                scores = []
+                with torch.no_grad():
+                    for i in range(batchSize):
+                        # Asegúrate de que los índices estén dentro de los límites
+                        audio_end = min((i+1) * duration * 100, audioFeature.shape[0])
+                        video_end = min((i+1) * duration * 25, videoFeature.shape[0])
+                        
+                        inputA = torch.FloatTensor(audioFeature[i * duration * 100:audio_end,:]).unsqueeze(0).cuda()
+                        inputV = torch.FloatTensor(videoFeature[i * duration * 25:video_end,:,:]).unsqueeze(0).cuda()
+                        inputVB = torch.FloatTensor(videoFeatureBody[i * duration * 25:video_end,:,:]).unsqueeze(0).cuda()
 
-					inputA = torch.FloatTensor(audioFeature[i * duration * 100:(i+1) * duration * 100,:]).unsqueeze(0).cuda()
-					inputV = torch.FloatTensor(videoFeature[i * duration * 25: (i+1) * duration * 25,:,:]).unsqueeze(0).cuda()
-					inputVB = torch.FloatTensor(videoFeatureBody[i * duration * 25: (i+1) * duration * 25,:,:]).unsqueeze(0).cuda()
+                        # Asegúrate de que todos los tensores tengan la misma longitud en la dimensión 1
+                        min_len = min(inputA.size(1) // 4, inputV.size(1), inputVB.size(1))
+                        # En la función evaluate_network, después de procesar los tensores:
+                        if min_len == 0:
+                            print(f"Error: Longitud mínima es 0 para el batch {i}")
+                            # Crea tensores con valores predeterminados
+                            dummy_tensor = torch.zeros(1, 1, 128).cuda()  # Ajusta las dimensiones según sea necesario
+                            audioEmbed = dummy_tensor.clone()
+                            visualEmbed = dummy_tensor.clone()
+                            visualEmbedBody = dummy_tensor.clone()
+                            min_len = 1
+                            continue  # Salta al siguiente batch
+                            
+                        inputA = inputA[:, :min_len*4, :]
+                        inputV = inputV[:, :min_len, :, :]
+                        inputVB = inputVB[:, :min_len, :, :]
 
-					audioEmbed = s.model.forward_audio_frontend(inputA)
-					visualEmbed = s.model.forward_visual_frontend(inputV)	
-					visualEmbedBody = s.model.forward_visual_frontend_body(inputVB)	
+                        audioEmbed = s.model.forward_audio_frontend(inputA)
+                        visualEmbed = s.model.forward_visual_frontend(inputV)    
+                        visualEmbedBody = s.model.forward_visual_frontend_body(inputVB)    
 
-					# Self-Attention
-					audioEmbed = s.model.a_att(src = audioEmbed, tar = audioEmbed)
-					visualEmbed = s.model.v_att(src = visualEmbed, tar = visualEmbed)
-					visualEmbedBody = s.model.vb_att(src = visualEmbedBody, tar = visualEmbedBody)
-					# Feature combination
-					comb_feat = torch.cat((audioEmbed, visualEmbed, visualEmbedBody), dim=2).cuda()
-					outsComb = s.se(comb_feat)
-					outsComb = s.model.comb_att(src = outsComb, tar = outsComb)
+                        # Verifica que todos los embeddings tengan la misma longitud
+                        min_embed_len = min(audioEmbed.size(1), visualEmbed.size(1), visualEmbedBody.size(1))
+                        audioEmbed = audioEmbed[:, :min_embed_len, :]
+                        visualEmbed = visualEmbed[:, :min_embed_len, :]
+                        visualEmbedBody = visualEmbedBody[:, :min_embed_len, :]
 
-					out = s.model.forward_comb_backend(outsComb)
+                        # Self-Attention
+                        audioEmbed = s.model.a_att(src = audioEmbed, tar = audioEmbed)
+                        visualEmbed = s.model.v_att(src = visualEmbed, tar = visualEmbed)
+                        visualEmbedBody = s.model.vb_att(src = visualEmbedBody, tar = visualEmbedBody)
+                        
+                        # Feature combination
+                        comb_feat = torch.cat((audioEmbed, visualEmbed, visualEmbedBody), dim=2).cuda()
+                        outsComb = s.se(comb_feat)
+                        outsComb = s.model.comb_att(src = outsComb, tar = outsComb)
 
-					score = s.lossComb.forward(out, labels = None)
-					scores.extend(score)
-			allScore.append(scores)
-		allScore = numpy.round((numpy.mean(numpy.array(allScore), axis = 0)), 1).astype(float)
-		allScores.append(allScore)	
-	return allScores
+                        out = s.model.forward_comb_backend(outsComb)
+
+                        score = s.lossComb.forward(out, labels = None)
+                        scores.extend(score)
+                allScore.append(scores)
+            
+            # Si no hay scores, crea un score predeterminado
+            if len(allScore) == 0 or all(len(scores) == 0 for scores in allScore):
+                print(f"No se pudieron generar scores para {fileName}, usando valor predeterminado")
+                allScore = [[0.5]]  # Valor neutral
+                
+            allScore = numpy.round((numpy.mean(numpy.array(allScore), axis = 0)), 1).astype(float)
+            allScores.append(allScore)
+            
+        except Exception as e:
+            print(f"Error procesando {fileName}: {str(e)}")
+            # Agrega un score predeterminado
+            allScores.append(numpy.array([0.5]))  # Valor neutral
+            
+    return allScores
+    
 
 def bb_intersection_over_union(boxA, boxB, evalCol = False):
 	# CPU: IOU Function to calculate overlap between two image
@@ -127,74 +230,81 @@ def bb_intersection_over_union(boxA, boxB, evalCol = False):
 	return iou
 
 def evaluate_col_ASD(tracks, scores, args):
-	txtPath = args.videoFolder + '/col_labels/fusion/*.txt' # Load labels
-	predictionSet = {}
-	for name in {'long', 'bell', 'boll', 'lieb', 'sick', 'abbas'}:
-		predictionSet[name] = [[],[]]
-	dictGT = {}
-	txtFiles = glob.glob("%s"%txtPath)
-	for file in txtFiles:
-		lines = open(file).read().splitlines()
-		idName = file.split('/')[-1][:-4]
-		for line in lines:
-			data = line.split('\t')
-			frame = int(int(data[0]) / 29.97 * 25)
-			# Cara
-			x1 = int(data[1])
-			y1 = int(data[2])
-			x2 = int(data[1]) + int(data[3])
-			y2 = int(data[2]) + int(data[3])
+    txtPath = args.videoFolder + '/col_labels/fusion/*.txt' # Load labels
+    predictionSet = {}
+    for name in {'long', 'bell', 'boll', 'lieb', 'sick', 'abbas'}:
+        predictionSet[name] = [[],[]]
+    dictGT = {}
+    txtFiles = glob.glob("%s"%txtPath)
+    for file in txtFiles:
+        lines = open(file).read().splitlines()
+        idName = file.split('/')[-1][:-4]
+        for line in lines:
+            data = line.split('\t')
+            frame = int(int(data[0]) / 29.97 * 25)
+            # Cara
+            x1 = int(data[1])
+            y1 = int(data[2])
+            x2 = int(data[1]) + int(data[3])
+            y2 = int(data[2]) + int(data[3])
 
-			gt = int(data[4])
-			if frame in dictGT:
-				dictGT[frame].append([x1,y1,x2,y2,gt,idName])
-			else:
-				dictGT[frame] = [[x1,y1,x2,y2,gt,idName]]	
-	flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg')) # Load files
-	flist.sort()
-	faces = [[] for i in range(len(flist))]
-	for tidx, track in enumerate(tracks):
-		score = scores[tidx]				
-		for fidx, frame in enumerate(track['track']['frame'].tolist()):
-			s = numpy.mean(score[max(fidx - 2, 0): min(fidx + 3, len(score) - 1)]) # average smoothing
-			faces[frame].append({'track':tidx, 'score':float(s),'s':track['proc_track']['s'][fidx], 'x':track['proc_track']['x'][fidx], 'y':track['proc_track']['y'][fidx]})
-	for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
-		if fidx in dictGT: # This frame has label
-			for gtThisFrame in dictGT[fidx]: # What this label is ?
-				faceGT = gtThisFrame[0:4]
-				labelGT = gtThisFrame[4]
-				idGT = gtThisFrame[5]
-				ious = []
-				for face in faces[fidx]: # Find the right face in my result
-					# faceLocation_new = [int(face['x']-face['s']), int(face['y']-face['s']), int(face['x']+face['s']), int(face['y']+face['s'])]
-					faceLocation_new = [int(face['x']-face['s']) // 2, int(face['y']-face['s']) // 2, int(face['x']+face['s']) // 2, int(face['y']+face['s']) // 2]
-					iou = bb_intersection_over_union(faceLocation_new, faceGT, evalCol = True)
-					if iou > 0.5:
-						ious.append([iou, round(face['score'],2)])
-				if len(ious) > 0: # Find my result
-					ious.sort()
-					labelPredict = ious[-1][1]
-				else:					
-					labelPredict = 0
-				x1 = faceGT[0]
-				y1 = faceGT[1]
-				width = faceGT[2] - faceGT[0]
-				predictionSet[idGT][0].append(labelPredict)
-				predictionSet[idGT][1].append(labelGT)
-	names = ['long', 'bell', 'boll', 'lieb', 'sick', 'abbas'] # Evaluate
-	names.sort()
-	F1s = 0
-	for i in names:
-		scores = numpy.array(predictionSet[i][0])
-		labels = numpy.array(predictionSet[i][1])
-		scores = numpy.int64(scores > 0)
-		F1 = f1_score(labels, scores)
-		ACC = accuracy_score(labels, scores)
-		if i != 'abbas':
-			F1s += F1
-			print("%s, ACC:%.2f, F1:%.2f"%(i, 100 * ACC, 100 * F1))
-	print("Average F1:%.2f"%(100 * (F1s / 5)))	  
-
+            gt = int(data[4])
+            if frame in dictGT:
+                dictGT[frame].append([x1,y1,x2,y2,gt,idName])
+            else:
+                dictGT[frame] = [[x1,y1,x2,y2,gt,idName]]    
+    flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg')) # Load files
+    flist.sort()
+    faces = [[] for i in range(len(flist))]
+    for tidx, track in enumerate(tracks):
+        score = scores[tidx]
+        # Verifica si track['track']['frame'] es un array de NumPy o una lista
+        frames = track['track']['frame']
+        if hasattr(frames, 'tolist'):
+            frames = frames.tolist()  # Convierte a lista si es un array de NumPy
+            
+        for fidx, frame in enumerate(frames):
+            s = numpy.mean(score[max(fidx - 2, 0): min(fidx + 3, len(score) - 1)]) # average smoothing
+            faces[frame].append({'track':tidx, 'score':float(s),'s':track['proc_track']['s'][fidx], 'x':track['proc_track']['x'][fidx], 'y':track['proc_track']['y'][fidx]})
+    
+    for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
+        if fidx in dictGT: # This frame has label
+            for gtThisFrame in dictGT[fidx]: # What this label is ?
+                faceGT = gtThisFrame[0:4]
+                labelGT = gtThisFrame[4]
+                idGT = gtThisFrame[5]
+                ious = []
+                for face in faces[fidx]: # Find the right face in my result
+                    # faceLocation_new = [int(face['x']-face['s']), int(face['y']-face['s']), int(face['x']+face['s']), int(face['y']+face['s'])]
+                    faceLocation_new = [int(face['x']-face['s']) // 2, int(face['y']-face['s']) // 2, int(face['x']+face['s']) // 2, int(face['y']+face['s']) // 2]
+                    iou = bb_intersection_over_union(faceLocation_new, faceGT, evalCol = True)
+                    if iou > 0.5:
+                        ious.append([iou, round(face['score'],2)])
+                if len(ious) > 0: # Find my result
+                    ious.sort()
+                    labelPredict = ious[-1][1]
+                else:                    
+                    labelPredict = 0
+                x1 = faceGT[0]
+                y1 = faceGT[1]
+                width = faceGT[2] - faceGT[0]
+                predictionSet[idGT][0].append(labelPredict)
+                predictionSet[idGT][1].append(labelGT)
+    names = ['long', 'bell', 'boll', 'lieb', 'sick', 'abbas'] # Evaluate
+    names.sort()
+    F1s = 0
+    for i in names:
+        scores = numpy.array(predictionSet[i][0])
+        labels = numpy.array(predictionSet[i][1])
+        scores = numpy.int64(scores > 0)
+        F1 = f1_score(labels, scores)
+        ACC = accuracy_score(labels, scores)
+        if i != 'abbas':
+            F1s += F1
+            print("%s, ACC:%.2f, F1:%.2f"%(i, 100 * ACC, 100 * F1))
+    print("Average F1:%.2f"%(100 * (F1s / 5)))
+    
+    
 # Main function
 def main():
 	

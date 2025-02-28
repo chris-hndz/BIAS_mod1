@@ -11,7 +11,7 @@ import pickle
 import warnings
 warnings.filterwarnings("ignore")
 
-device="cuda:3"    
+device="cuda:0" if torch.cuda.is_available() else "cpu"  
 
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=16):
